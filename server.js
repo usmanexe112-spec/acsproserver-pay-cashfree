@@ -1,33 +1,30 @@
 const https = require("https");
 const http  = require("http");
 
-// ── Cashfree Production Credentials ────────────────────────────────────────
-const APP_ID    = process.env.CASHFREE_APP_ID    || "11085212bfc8f80fc1248c655a81258011";
-const SECRET    = process.env.CASHFREE_SECRET    || "cfsk_ma_prod_0cd77743f25070a41ac286fb603b6c17_3c99769a";
-const CF_URL    = "api.cashfree.com";
-const SITE_URL  = process.env.SITE_URL || "https://affluentconsultancy.in";
-const PORT      = process.env.PORT || 3000;
+// ── PhonePe Production Credentials ─────────────────────────────────────────
+const CLIENT_ID      = process.env.PHONEPE_CLIENT_ID      || "SU2605271219483440801383";
+const CLIENT_SECRET  = process.env.PHONEPE_CLIENT_SECRET  || "00f6cf0e-d4a0-40b5-a5b6-45235fdee885";
+const CLIENT_VERSION = process.env.PHONEPE_CLIENT_VERSION || "1";
+const SITE_URL       = process.env.SITE_URL               || "https://affluentconsultancy.co.in";
+const PORT           = process.env.PORT || 3000;
 
-// ── HTTPS request helper ────────────────────────────────────────────────────
-function httpsReq(method, hostname, path, headers, body) {
+// ── HTTPS POST helper ───────────────────────────────────────────────────────
+function httpsPost(hostname, path, headers, body) {
   return new Promise((resolve, reject) => {
-    const buf = body ? Buffer.from(body, "utf8") : null;
-    const opts = {
-      hostname,
-      path,
-      method,
-      headers: buf ? { ...headers, "Content-Length": buf.length } : headers
-    };
-    const req = https.request(opts, (res) => {
-      let raw = "";
-      res.on("data", c => raw += c);
-      res.on("end", () => {
-        try { resolve({ status: res.statusCode, data: JSON.parse(raw) }); }
-        catch (e) { reject(new Error("Bad JSON: " + raw.substring(0, 300))); }
-      });
-    });
+    const buf = Buffer.from(body, "utf8");
+    const req = https.request(
+      { hostname, path, method: "POST", headers: { ...headers, "Content-Length": buf.length } },
+      (res) => {
+        let raw = "";
+        res.on("data", c => raw += c);
+        res.on("end", () => {
+          try { resolve(JSON.parse(raw)); }
+          catch (e) { reject(new Error("Bad JSON: " + raw.substring(0, 300))); }
+        });
+      }
+    );
     req.on("error", reject);
-    if (buf) req.write(buf);
+    req.write(buf);
     req.end();
   });
 }
@@ -60,7 +57,7 @@ const server = http.createServer(async (req, res) => {
   // Health check
   if (req.method === "GET" && url === "/") {
     res.writeHead(200);
-    res.end(JSON.stringify({ status: "Affluent Consultancy Payment Server is running!" }));
+    res.end(JSON.stringify({ status: "Affluent Consultancy .co.in Payment Server is running!" }));
     return;
   }
 
@@ -71,7 +68,7 @@ const server = http.createServer(async (req, res) => {
       const amount = parseFloat(body.amount);
       const name   = String(body.name  || "Customer").trim();
       const phone  = String(body.phone || "9999999999").trim();
-      const email  = String(body.email || "no-reply@affluentconsultancy.in").trim();
+      const email  = String(body.email || "").trim();
 
       if (!amount || amount < 1) {
         res.writeHead(400);
@@ -79,69 +76,82 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const orderId   = "ACS" + Date.now() + Math.random().toString(36).substr(2, 4).toUpperCase();
-      const returnUrl = SITE_URL + "/payments/status/?order_id=" + orderId;
+      // ── STEP 1: Get Token ───────────────────────────────────────────────
+      const tokenBody = [
+        "client_id="      + encodeURIComponent(CLIENT_ID),
+        "client_version=" + encodeURIComponent(CLIENT_VERSION),
+        "client_secret="  + encodeURIComponent(CLIENT_SECRET),
+        "grant_type=client_credentials"
+      ].join("&");
 
-      // Cashfree Create Order API
-      const payload = JSON.stringify({
-        order_id:       orderId,
-        order_amount:   amount,
-        order_currency: "INR",
-        customer_details: {
-          customer_id:    "CUST_" + Date.now(),
-          customer_name:  name,
-          customer_phone: phone,
-          customer_email: email
-        },
-        order_meta: {
-          return_url: returnUrl,
-          notify_url: SITE_URL + "/api/webhook"
-        }
-      });
-
-      console.log("Creating Cashfree order:", orderId, "amount:", amount);
-
-      let result;
+      let tokenData;
       try {
-        result = await httpsReq(
-          "POST",
-          CF_URL,
-          "/pg/orders",
-          {
-            "Content-Type":  "application/json",
-            "x-api-version": "2023-08-01",
-            "x-client-id":   APP_ID,
-            "x-client-secret": SECRET
-          },
-          payload
+        tokenData = await httpsPost(
+          "api.phonepe.com",
+          "/apis/identity-manager/v1/oauth/token",
+          { "Content-Type": "application/x-www-form-urlencoded" },
+          tokenBody
         );
       } catch (e) {
-        console.error("Cashfree error:", e.message);
+        console.error("Token error:", e.message);
         res.writeHead(502);
-        res.end(JSON.stringify({ success: false, error: "Could not reach payment gateway. Try again." }));
+        res.end(JSON.stringify({ success: false, error: "Could not reach PhonePe. Try again." }));
         return;
       }
 
-      console.log("Cashfree response:", JSON.stringify(result.data));
+      console.log("Token response:", JSON.stringify(tokenData));
 
-      // Cashfree returns payment_session_id on success
-      if (result.data && result.data.payment_session_id) {
+      if (!tokenData.access_token) {
+        res.writeHead(502);
+        res.end(JSON.stringify({ success: false, error: "PhonePe auth failed.", detail: tokenData }));
+        return;
+      }
+
+      // ── STEP 2: Create Payment ──────────────────────────────────────────
+      const orderId     = "ACS" + Date.now() + Math.random().toString(36).substr(2, 4).toUpperCase();
+      const redirectUrl = SITE_URL + "/payments/status/?order_id=" + orderId;
+      const amountPaise = Math.round(amount * 100);
+
+      const paymentPayload = JSON.stringify({
+        merchantOrderId: orderId,
+        amount:          amountPaise,
+        expireAfter:     1200,
+        metaInfo:        { udf1: name, udf2: phone, udf3: email, udf4: "", udf5: "" },
+        paymentFlow: {
+          type:    "PG_CHECKOUT",
+          message: "Payment for Affluent Consultancy Services",
+          merchantUrls: { redirectUrl }
+        }
+      });
+
+      let orderData;
+      try {
+        orderData = await httpsPost(
+          "api.phonepe.com",
+          "/apis/pg/checkout/v2/pay",
+          {
+            "Content-Type":  "application/json",
+            "Authorization": "O-Bearer " + tokenData.access_token
+          },
+          paymentPayload
+        );
+      } catch (e) {
+        console.error("Order error:", e.message);
+        res.writeHead(502);
+        res.end(JSON.stringify({ success: false, error: "Could not create payment. Try again." }));
+        return;
+      }
+
+      console.log("Order response:", JSON.stringify(orderData));
+
+      if (orderData.redirectUrl) {
         res.writeHead(200);
-        res.end(JSON.stringify({
-          success:           true,
-          payment_session_id: result.data.payment_session_id,
-          order_id:          orderId,
-          order_token:       result.data.order_token || ""
-        }));
+        res.end(JSON.stringify({ success: true, redirectUrl: orderData.redirectUrl, orderId }));
         return;
       }
 
       res.writeHead(502);
-      res.end(JSON.stringify({
-        success: false,
-        error:   result.data?.message || "Payment gateway error. Please try again.",
-        detail:  result.data
-      }));
+      res.end(JSON.stringify({ success: false, error: "PhonePe did not return checkout URL.", detail: orderData }));
 
     } catch (err) {
       console.error("Unhandled:", err.message);
@@ -156,5 +166,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log("Payment server running on port " + PORT);
+  console.log("PhonePe payment server running on port " + PORT);
 });
